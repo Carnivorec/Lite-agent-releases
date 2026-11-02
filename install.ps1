@@ -1,0 +1,523 @@
+# Windows PowerShell installation script for Lite-agent
+
+# Logging functions with colors
+function Log-Info { param([string]$Message) Write-Host "$Message"    -ForegroundColor Cyan }
+function Log-Success { param([string]$Message) Write-Host "$Message"    -ForegroundColor Green }
+function Log-Warning { param([string]$Message) Write-Host "[WARNING] $Message"    -ForegroundColor Yellow }
+function Log-Error { param([string]$Message) Write-Host "[ERROR] $Message"    -ForegroundColor Red }
+function Log-Step { param([string]$Message) Write-Host "$Message"    -ForegroundColor Magenta }
+function Log-Config { param([string]$Message) Write-Host "- $Message"    -ForegroundColor White }
+
+function Redact-AgentArgs {
+    param([string[]]$ArgList)
+    $out = New-Object System.Collections.Generic.List[string]
+    $hideNext = $false
+    foreach ($item in @($ArgList)) {
+        if ($hideNext) {
+            $out.Add("***") | Out-Null
+            $hideNext = $false
+            continue
+        }
+        if ($item -eq "-t" -or $item -eq "--token" -or $item -eq "--cf-access-client-secret") {
+            $out.Add($item) | Out-Null
+            $hideNext = $true
+            continue
+        }
+        if ($item -like "--token=*") {
+            $out.Add("--token=***") | Out-Null
+            continue
+        }
+        if ($item -like "--cf-access-client-secret=*") {
+            $out.Add("--cf-access-client-secret=***") | Out-Null
+            continue
+        }
+        $out.Add($item) | Out-Null
+    }
+    return ($out -join " ")
+}
+
+# Default parameters
+$InstallDir = Join-Path $Env:ProgramFiles "Lite"
+$ServiceName = "lite-agent"
+$GitHubProxy = ""
+$AgentArgs = @()
+$InstallVersion = ""
+$GitHubRepo = "Carnivorec/Lite-agent-releases"
+$LegacyServiceName = "komari-agent"
+$CustomLayout = $false
+
+# Parse script arguments
+for ($i = 0; $i -lt $args.Count; $i++) {
+    switch ($args[$i]) {
+        "--install-dir" { $InstallDir = $args[$i + 1]; $CustomLayout = $true; $i++; continue }
+        "--install-service-name" { $ServiceName = $args[$i + 1]; $CustomLayout = $true; $i++; continue }
+        "--install-ghproxy" { $GitHubProxy = $args[$i + 1]; $i++; continue }
+        "--install-version" { $InstallVersion = $args[$i + 1]; $i++; continue }
+        Default { $AgentArgs += $args[$i] }
+    }
+}
+
+# Ensure running as Administrator
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
+    Log-Error "Please run this script as Administrator."
+    exit 1
+}
+
+# Prepare GitHub proxy display
+if ($GitHubProxy -ne '') { $ProxyDisplay = $GitHubProxy } else { $ProxyDisplay = '(direct)' }
+
+# Detect architecture early for constructing binary name
+switch ($env:PROCESSOR_ARCHITECTURE) {
+    'AMD64' { $arch = 'amd64' }
+    'ARM64' { $arch = 'arm64' }
+    'x86' { $arch = '386' }
+    Default { Log-Error "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE"; exit 1 }
+}
+
+# Ensure installation directory exists for nssm and agent
+Log-Step "Ensuring installation directory exists: $InstallDir"
+New-Item -ItemType Directory -Path $InstallDir -Force -ErrorAction SilentlyContinue | Out-Null # Ensure $InstallDir exists
+
+# Check for nssm and download if not present
+$nssmExeToUse = Join-Path $InstallDir "nssm.exe"
+if (-not $CustomLayout) {
+    $legacyNssm = Join-Path (Join-Path $Env:ProgramFiles "Komari") "nssm.exe"
+    if ((Test-Path $legacyNssm) -and -not (Test-Path $nssmExeToUse)) {
+        Copy-Item $legacyNssm $nssmExeToUse -Force
+    }
+}
+
+# First, check if nssm is in PATH and is functional
+$nssmCmd = Get-Command nssm -ErrorAction SilentlyContinue
+if ($nssmCmd) {
+    Log-Info "nssm found in PATH at $($nssmCmd.Source)."
+    try {
+        $nssmVersionOutput = nssm version 2>&1
+        Log-Info "Detected nssm version: $nssmVersionOutput"
+    }
+    catch {
+        Log-Warning "nssm found in PATH failed to execute 'nssm version'. Will attempt to use/download local copy. Error: $_"
+        $nssmCmd = $null # Force re-evaluation for local copy or download
+    }
+}
+
+# If nssm not found in PATH or the one in PATH failed, check local $InstallDir
+if (-not $nssmCmd) {
+    if (Test-Path $nssmExeToUse) {
+        Log-Info "nssm found at $nssmExeToUse. Attempting to use it by adding $InstallDir to PATH."
+        $env:Path = "$($InstallDir);$($env:Path)"
+        $nssmCmd = Get-Command nssm -ErrorAction SilentlyContinue
+        if ($nssmCmd) {
+            try {
+                $nssmVersionOutput = nssm version 2>&1
+            }
+            catch {
+                Log-Warning "nssm from $InstallDir failed to execute 'nssm version'. Error: $_"
+                $nssmCmd = $null # Mark as unusable
+            }
+        }
+        else {
+            Log-Warning "Failed to make nssm from $nssmExeToUse available via PATH. Will attempt download."
+        }
+    }
+}
+
+# If still no usable nssm command, proceed to download
+if (-not $nssmCmd) {
+    Log-Info "nssm not found or not usable. Attempting to download to $InstallDir..."
+    $NssmVersion = "2.24"
+    $NssmZipUrl = "https://nssm.cc/release/nssm-$NssmVersion.zip"
+    $TempNssmZipPath = Join-Path $env:TEMP "nssm-$NssmVersion.zip"
+    $TempExtractDir = Join-Path $env:TEMP "nssm_extract_temp"
+
+    try {
+        Log-Info "Downloading nssm from $NssmZipUrl..."
+        Invoke-WebRequest -Uri $NssmZipUrl -OutFile $TempNssmZipPath -UseBasicParsing
+
+        if (Test-Path $TempExtractDir) { Remove-Item -Recurse -Force $TempExtractDir }
+        New-Item -ItemType Directory -Path $TempExtractDir -Force | Out-Null
+        Expand-Archive -Path $TempNssmZipPath -DestinationPath $TempExtractDir -Force
+        
+        $NssmSourceDirInsideZip = "nssm-$NssmVersion" # Used for Get-ChildItem search path
+        # The path part within the extracted nssm folder, e.g., "nssm-2.24\win32"
+        # 'win32' nssm is used for both 'amd64' and 'arm64' PowerShell architectures.
+        $NssmArchSubDir = Join-Path "nssm-$NssmVersion" "win32"
+        $NssmSourceExePath = Join-Path (Join-Path $TempExtractDir $NssmArchSubDir) "nssm.exe"
+
+        if (-not (Test-Path $NssmSourceExePath)) {
+            Log-Error "Could not find nssm.exe at expected path: $NssmSourceExePath after extraction."
+            # Fallback search for nssm.exe within the extracted directory
+            $foundNssmFallback = Get-ChildItem -Path $TempExtractDir -Recurse -Filter "nssm.exe" | 
+            Where-Object { $_.FullName -like "*$NssmArchSubDir\nssm.exe" } | 
+            Select-Object -First 1
+            if ($foundNssmFallback) {
+                Log-Warning "Found nssm.exe at $($foundNssmFallback.FullName) using fallback search. Using this."
+                $NssmSourceExePath = $foundNssmFallback.FullName
+            }
+            else {
+                Log-Error "nssm.exe ($NssmArchSubDir) still not found in $TempExtractDir. Please install nssm manually (from https://nssm.cc) and ensure it's in your PATH."
+                exit 1
+            }
+        }
+        
+        Copy-Item -Path $NssmSourceExePath -Destination $nssmExeToUse -Force
+
+        $env:Path = "$($InstallDir);$($env:Path)"
+        $nssmCmd = Get-Command nssm -ErrorAction SilentlyContinue # Re-check after adding to PATH
+        if ($nssmCmd) {
+            Log-Success "Downloaded nssm is now configured and available in PATH."
+        }
+        else {
+            Log-Error "Failed to configure downloaded nssm in PATH from $nssmExeToUse. Please ensure $InstallDir is in your system PATH or nssm is installed globally."
+            exit 1
+        }
+    }
+    catch {
+        Log-Error "Failed to download or configure nssm: $_"
+        Log-Error "Please install nssm manually from https://nssm.cc and ensure nssm.exe is in your PATH."
+        exit 1
+    }
+    finally {
+        if (Test-Path $TempNssmZipPath) { Remove-Item $TempNssmZipPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $TempExtractDir) { Remove-Item $TempExtractDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# Final check that nssm is operational
+try {
+    $nssmVersionOutput = nssm version 2>&1
+}
+catch {
+    Log-Error "nssm command failed to execute even after setup attempts. Please check the nssm installation and PATH. Error: $_"
+    exit 1
+}
+
+Log-Step "Installation configuration:"
+Log-Config "Service name: $ServiceName"
+Log-Config "Install directory: $InstallDir"
+Log-Config "Process: $(Join-Path $InstallDir 'Lite-agent.exe')"
+Log-Config "GitHub proxy: $ProxyDisplay"
+Log-Config "Agent arguments: $(Redact-AgentArgs $AgentArgs)"
+if ($InstallVersion -ne "") {
+    Log-Config "Specified agent version: $InstallVersion"
+} else {
+    Log-Config "Agent version: Latest"
+}
+
+# Paths
+$BinaryName = "Lite-agent-windows-$arch.exe"
+$AgentPath = Join-Path $InstallDir "Lite-agent.exe"
+$LegacyDir = Join-Path $Env:ProgramFiles "Komari"
+$LegacyAgentPath = Join-Path $LegacyDir "komari-agent.exe"
+
+function Copy-SidecarsFrom {
+    param([string]$SourceDir)
+    if (-not (Test-Path $SourceDir) -or $SourceDir -eq $InstallDir) { return }
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    foreach ($name in @("auto-discovery.json", "net_static.json", "net_static.json.bak", "nssm.exe", "node.json", "remote-control.state", "config.json")) {
+        $src = Join-Path $SourceDir $name
+        $dst = Join-Path $InstallDir $name
+        if ((Test-Path $src) -and -not (Test-Path $dst)) {
+            Log-Info "Copying $name from $SourceDir"
+            Copy-Item $src $dst -Force
+        }
+    }
+}
+
+function Remove-AgentService {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return }
+    if (-not (Test-AgentServiceExists $Name)) { return }
+    $serviceStatus = & nssm status $Name 2>&1 | Out-String
+    if ($serviceStatus -notmatch "SERVICE_STOPPED") {
+        Log-Info "Stopping service $Name..."
+        & nssm stop $Name 2>&1 | Out-Null
+    }
+    Log-Info "Removing service $Name..."
+    $removeOutput = & nssm remove $Name confirm 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+        return
+    }
+    if ($removeOutput -match "Can't open service" -or $removeOutput -match "No such service" -or $removeOutput -match "does not exist") {
+        return
+    }
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if ($svc) {
+        Stop-Service $Name -Force -ErrorAction SilentlyContinue
+        sc.exe delete $Name | Out-Null
+    }
+}
+
+function Wait-AgentService {
+    param([string]$Name)
+    for ($i = 0; $i -lt 15; $i++) {
+        $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') { return $true }
+        $status = & nssm status $Name 2>&1 | Out-String
+        if ($status -match 'SERVICE_RUNNING') { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function Test-AgentServiceExists {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if ($svc) { return $true }
+    $status = & nssm status $Name 2>&1 | Out-String
+    if ($status -match 'SERVICE_(STOPPED|RUNNING|PAUSED|START_PENDING|STOP_PENDING|CONTINUE_PENDING|PAUSE_PENDING)') {
+        return $true
+    }
+    return $false
+}
+
+function Test-LegacyInstallPresent {
+    if (Test-AgentServiceExists $LegacyServiceName) { return $true }
+    return (Test-Path $LegacyDir)
+}
+
+function ConvertFrom-ArgString {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    return @($Text.Trim() -split '\s+' | Where-Object { $_ -ne '' })
+}
+
+function Test-HasNamedFlag {
+    param([string[]]$ArgList, [string]$Name)
+    foreach ($item in @($ArgList)) {
+        if ($item -eq "--$Name" -or $item -like "--$Name=*") { return $true }
+    }
+    return $false
+}
+
+function Get-NamedFlagValue {
+    param([string[]]$ArgList, [string]$Name)
+    foreach ($item in @($ArgList)) {
+        if ($item -eq "--$Name") { return "true" }
+        if ($item.StartsWith("--$Name=")) { return $item.Substring("--$Name=".Length) }
+    }
+    return "true"
+}
+
+function Get-FlagArgValue {
+    param([string[]]$ArgList, [string]$Name)
+    $items = @($ArgList)
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $item = $items[$i]
+        if ($item -eq "--$Name") {
+            if (($i + 1) -lt $items.Count -and -not $items[$i + 1].StartsWith("-")) {
+                return $items[$i + 1]
+            }
+            return ""
+        }
+        if ($item.StartsWith("--$Name=")) {
+            return $item.Substring("--$Name=".Length)
+        }
+    }
+    return ""
+}
+
+function Preserve-ExistingConfigArg {
+    param([string[]]$Incoming, [string[]]$ExistingArgs)
+    if (Test-HasNamedFlag $Incoming "config") {
+        return @($Incoming)
+    }
+    $cfg = Get-FlagArgValue $ExistingArgs "config"
+    if ([string]::IsNullOrWhiteSpace($cfg) -or -not (Test-Path $cfg)) {
+        return @($Incoming)
+    }
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    $dest = Join-Path $InstallDir (Split-Path $cfg -Leaf)
+    if ($cfg -ne $dest -and -not (Test-Path $dest)) {
+        Log-Info "Copying config $(Split-Path $cfg -Leaf) to $InstallDir"
+        Copy-Item $cfg $dest -Force
+    }
+    if (Test-Path $dest) {
+        Log-Info "Keeping existing --config $dest"
+        return @($Incoming + "--config" + $dest)
+    }
+    return @($Incoming)
+}
+
+function ConvertTo-BoolFlag {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    switch ($Value.Trim().ToLowerInvariant()) {
+        "false" { return $false }
+        "0" { return $false }
+        "no" { return $false }
+        "off" { return $false }
+        default { return $true }
+    }
+}
+
+function Add-RemoteControlArg {
+    param([string[]]$ArgList, [bool]$Enabled)
+    $trimmed = @($ArgList | Where-Object {
+            $_ -notmatch '^--enable-remote-control(=|$)' -and $_ -notmatch '^--disable-web-ssh(=|$)'
+        })
+    if ($Enabled) {
+        return @($trimmed + "--enable-remote-control=true")
+    }
+    return @($trimmed + "--enable-remote-control=false")
+}
+
+function Resolve-RemoteControlInstallArgs {
+    param([string[]]$Incoming, [bool]$ManagedExists, [string[]]$ExistingArgs)
+    if (Test-HasNamedFlag $Incoming "enable-remote-control") {
+        return @($Incoming)
+    }
+    if (Test-HasNamedFlag $Incoming "disable-web-ssh") {
+        $disabled = ConvertTo-BoolFlag (Get-NamedFlagValue $Incoming "disable-web-ssh")
+        return @(Add-RemoteControlArg $Incoming (-not $disabled))
+    }
+    $statePath = Join-Path $InstallDir "remote-control.state"
+    if (Test-Path -LiteralPath $statePath) {
+        $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        if ($state.remote_control_enabled -is [bool] -and -not $state.remote_control_enabled) {
+            $Incoming = @(Add-RemoteControlArg $Incoming $false)
+        }
+    }
+    $cfg = Get-FlagArgValue $Incoming "config"
+    if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg = Join-Path $InstallDir "config.json" }
+    if (Test-Path -LiteralPath $cfg) {
+        $saved = Get-Content -LiteralPath $cfg -Raw | ConvertFrom-Json
+        if (($saved.remote_control_enabled -is [bool] -and -not $saved.remote_control_enabled) -or
+            ($saved.disable_web_ssh -is [bool] -and $saved.disable_web_ssh)) {
+            $Incoming = @(Add-RemoteControlArg $Incoming $false)
+        }
+        if ($null -ne $saved.PSObject.Properties['remote_control_enabled'] -or
+            $null -ne $saved.PSObject.Properties['disable_web_ssh']) {
+            if (-not (Test-HasNamedFlag $Incoming "config")) {
+                return @($Incoming + "--config" + $cfg)
+            }
+            return @($Incoming)
+        }
+    }
+    if (Test-Path -LiteralPath $statePath) {
+        return @($Incoming)
+    }
+    if (-not $ManagedExists) {
+        return @(Add-RemoteControlArg $Incoming $false)
+    }
+    if (Test-HasNamedFlag $ExistingArgs "enable-remote-control") {
+        $enabled = ConvertTo-BoolFlag (Get-NamedFlagValue $ExistingArgs "enable-remote-control")
+        return @(Add-RemoteControlArg $Incoming $enabled)
+    }
+    if (Test-HasNamedFlag $ExistingArgs "disable-web-ssh") {
+        $disabled = ConvertTo-BoolFlag (Get-NamedFlagValue $ExistingArgs "disable-web-ssh")
+        return @(Add-RemoteControlArg $Incoming (-not $disabled))
+    }
+    return @(Add-RemoteControlArg $Incoming $false)
+}
+
+$managedExists = $false
+$existingArgs = @()
+if (Test-AgentServiceExists $ServiceName) {
+    $managedExists = $true
+    $existingArgs = ConvertFrom-ArgString ((nssm get $ServiceName AppParameters 2>&1 | Out-String))
+}
+elseif (-not $CustomLayout -and (Test-AgentServiceExists $LegacyServiceName)) {
+    $managedExists = $true
+    $existingArgs = ConvertFrom-ArgString ((nssm get $LegacyServiceName AppParameters 2>&1 | Out-String))
+}
+
+if (-not $CustomLayout) {
+    Copy-SidecarsFrom -SourceDir $LegacyDir
+}
+else {
+    if (Test-LegacyInstallPresent) {
+        Log-Step "Custom install layout; leaving komari-agent in place."
+    }
+    Remove-AgentService -Name $ServiceName
+}
+$AgentArgs = @(Preserve-ExistingConfigArg -Incoming $AgentArgs -ExistingArgs $existingArgs)
+$AgentArgs = @(Resolve-RemoteControlInstallArgs -Incoming $AgentArgs -ManagedExists $managedExists -ExistingArgs $existingArgs)
+
+function Get-DownloadUrl {
+    param([string]$Repo, [string]$Tag, [string]$Name)
+    $ReleasePath = if ([string]::IsNullOrWhiteSpace($Tag) -or $Tag -eq "latest") {
+        "latest/download/$Name"
+    }
+    else {
+        "download/$Tag/$Name"
+    }
+    $Url = "https://github.com/$Repo/releases/$ReleasePath"
+    if ($GitHubProxy) {
+        return "$($GitHubProxy.TrimEnd('/'))/$Url"
+    }
+    return $Url
+}
+
+$versionToInstall = "latest"
+if ($InstallVersion -ne "") {
+    Log-Info "Attempting to install specified version: $InstallVersion"
+    $versionToInstall = $InstallVersion
+}
+else {
+    Log-Info "No version specified, installing the latest version."
+}
+Log-Success "Installing Lite-agent version: $versionToInstall"
+
+# Stop the destination Lite-agent service before replacing the exe.
+# Leave komari-agent running until the new process is up.
+$existing = nssm status $ServiceName 2>&1 | Out-String
+if ($existing -notmatch "does not exist") {
+    Remove-AgentService -Name $ServiceName
+}
+
+$downloaded = $false
+foreach ($candidate in @(
+        @{ Repo = $GitHubRepo; Name = $BinaryName }
+    )) {
+    $DownloadUrl = Get-DownloadUrl $candidate.Repo $versionToInstall $candidate.Name
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    Log-Info "URL: $DownloadUrl"
+    try {
+        Invoke-WebRequest -Uri $DownloadUrl -OutFile $AgentPath -UseBasicParsing -UserAgent "Lite-agent-install (+https://github.com/nuomiiiii/Lite-agent)"
+        $downloaded = $true
+        break
+    }
+    catch {
+        Log-Warning "Download from $($candidate.Repo)/$($candidate.Name) failed: $_"
+    }
+}
+if (-not $downloaded) {
+    Log-Error "Download failed"
+    exit 1
+}
+Log-Success "Downloaded and saved to $AgentPath"
+
+# Register and start service
+Log-Step "Configuring Windows service with nssm..."
+$argString = $AgentArgs -join ' '
+$quotedAgentPath = "`"$AgentPath`""
+nssm install $ServiceName $quotedAgentPath $argString
+nssm set $ServiceName DisplayName "Lite Agent Service"
+nssm set $ServiceName Start SERVICE_AUTO_START
+nssm set $ServiceName AppExit Default Restart
+nssm set $ServiceName AppRestartDelay 5000
+nssm set $ServiceName AppDirectory $InstallDir
+nssm start $ServiceName
+if (-not (Wait-AgentService -Name $ServiceName)) {
+    if (Test-AgentServiceExists $LegacyServiceName) {
+        Log-Error "Lite-agent service $ServiceName did not become running; leaving komari-agent in place"
+    }
+    else {
+        Log-Error "Lite-agent service $ServiceName did not become running"
+    }
+    exit 1
+}
+if (-not $CustomLayout -and $ServiceName -ne $LegacyServiceName -and (Test-AgentServiceExists $LegacyServiceName)) {
+    Log-Step "Retiring legacy service $LegacyServiceName after Lite-agent is running..."
+    & nssm set $LegacyServiceName AppExit Default Exit 2>&1 | Out-Null
+    Remove-AgentService -Name $LegacyServiceName
+}
+Log-Success "Service $ServiceName installed and started using nssm."
+
+Log-Success "Lite-agent installation completed!"
+Log-Config "Service name: $ServiceName"
+Log-Config "Process: $AgentPath"
+Log-Config "Arguments: $(Redact-AgentArgs $AgentArgs)"
